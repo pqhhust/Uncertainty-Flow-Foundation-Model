@@ -1,0 +1,46 @@
+# @package _global_
+
+# Fine-tune Qwen2.5-0.5B on SST-2 (GLUE sentiment classification)
+# Run: python src/train.py experiment=finetune_sst2
+
+defaults:
+  - override /data: glue
+  - override /model: qwen2_finetune
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["qwen2", "sst2", "finetune"]
+
+seed: 42
+
+trainer:
+  min_epochs: 1
+  max_epochs: 3
+  gradient_clip_val: 1.0
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 2
+
+data:
+  task_name: "sst2"
+  model_name: "Qwen/Qwen2.5-0.5B"
+  max_length: 128
+  batch_size: 16
+  num_workers: 4
+
+model:
+  model_name: "Qwen/Qwen2.5-0.5B"
+  num_labels: 2
+  task_metric: "accuracy"
+  finetune_mode: "full"
+  learning_rate: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 200
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/accuracy"
+    mode: "max"
+  early_stopping:
+    monitor: "val/accuracy"
+    mode: "max"
+    patience: 5

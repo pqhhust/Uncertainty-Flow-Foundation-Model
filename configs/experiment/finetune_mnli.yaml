@@ -1,0 +1,46 @@
+# @package _global_
+
+# Fine-tune Qwen2.5-0.5B on MNLI (3-class NLI)
+# Run: python src/train.py experiment=finetune_mnli
+
+defaults:
+  - override /data: glue
+  - override /model: qwen2_finetune
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["qwen2", "mnli", "finetune"]
+
+seed: 42
+
+trainer:
+  min_epochs: 1
+  max_epochs: 3
+  gradient_clip_val: 1.0
+  precision: "bf16-mixed"
+  accumulate_grad_batches: 4
+
+data:
+  task_name: "mnli"
+  model_name: "Qwen/Qwen2.5-0.5B"
+  max_length: 256
+  batch_size: 8
+  num_workers: 4
+
+model:
+  model_name: "Qwen/Qwen2.5-0.5B"
+  num_labels: 3
+  task_metric: "accuracy"
+  finetune_mode: "full"
+  learning_rate: 2e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/accuracy"
+    mode: "max"
+  early_stopping:
+    monitor: "val/accuracy"
+    mode: "max"
+    patience: 3

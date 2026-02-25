@@ -1,0 +1,13 @@
+_target_: src.models.qwen2_finetune_module.Qwen2FineTuneModule
+
+model_name: "Qwen/Qwen2.5-0.5B"
+num_labels: 2
+task_metric: "accuracy"
+finetune_mode: "full"  # "full", "lora", "linear_probe"
+learning_rate: 2e-5
+weight_decay: 0.01
+warmup_steps: 200
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+compile: false

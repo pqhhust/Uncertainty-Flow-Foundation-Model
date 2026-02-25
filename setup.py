@@ -3,13 +3,24 @@
 from setuptools import find_packages, setup
 
 setup(
-    name="src",
-    version="0.0.1",
-    description="Describe Your Cool Project",
-    author="",
+    name="uffm",
+    version="0.1.0",
+    description="Uncertainty Flow Foundation Model - Distilling pretrained LLMs into flow-based models",
+    author="pqhung",
     author_email="",
-    url="https://github.com/user/project",
-    install_requires=["lightning", "hydra-core"],
+    url="https://github.com/user/uffm",
+    install_requires=[
+        "lightning",
+        "hydra-core",
+        "transformers",
+        "datasets",
+        "evaluate",
+        "accelerate",
+        "peft",
+        "transformer-lens",
+        "torchdiffeq",
+        "flow-matching",
+    ],
     packages=find_packages(),
     # use this to customize global commands available in the terminal after installing the package
     entry_points={

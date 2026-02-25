@@ -1,0 +1,9 @@
+_target_: src.data.glue_datamodule.GLUEDataModule
+
+model_name: "Qwen/Qwen2.5-0.5B"
+task_name: "sst2"
+max_length: 128
+batch_size: 32
+num_workers: 4
+pin_memory: True
+padding_side: "left"

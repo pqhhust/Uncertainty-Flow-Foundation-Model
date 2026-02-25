@@ -1,24 +1,37 @@
 # --------- pytorch --------- #
-torch>=2.0.0
-torchvision>=0.15.0
-lightning>=2.0.0
-torchmetrics>=0.11.4
+# torch>=2.0.0
+# torchvision>=0.15.0
+# lightning>=2.0.0
+# torchmetrics>=0.11.4
+torchmetrics
 
 # --------- hydra --------- #
 hydra-core==1.3.2
 hydra-colorlog==1.2.0
 hydra-optuna-sweeper==1.2.0
 
+# --------- transformers & datasets --------- #
+transformers>=4.40.0
+datasets>=2.18.0
+evaluate>=0.4.0
+accelerate>=0.28.0
+peft>=0.10.0
+sentencepiece
+
+# --------- flow matching & hooks --------- #
+transformer-lens>=2.0.0
+torchdiffeq>=0.2.3
+flow-matching>=1.0.0
+
 # --------- loggers --------- #
-# wandb
+wandb
 # neptune-client
 # mlflow
 # comet-ml
-# aim>=3.16.2  # no lower than 3.16.2, see https://github.com/aimhubio/aim/issues/2550
 
 # --------- others --------- #
 rootutils       # standardizing the project root setup
 pre-commit      # hooks for applying linters on commit
 rich            # beautiful text formatting in terminal
 pytest          # tests
-# sh            # for running bash commands in some tests (linux/macos only)
+timm            # for DiT attention/MLP blocks
