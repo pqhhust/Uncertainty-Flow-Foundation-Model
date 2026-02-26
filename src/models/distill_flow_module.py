@@ -6,7 +6,13 @@ discretized ODE step:
     X_{t+1} = FM_θ^(t)(X_t)
     velocity_target = (X_{t+1} - X_t) / Δt
 
-The student u_ω(X_t, t) is distilled to match these velocity targets, defining
+To ease learning, we apply *conditional flow matching* within each layer
+interval: instead of only training at layer boundaries, we sample s ~ U(0,1)
+and construct interpolated inputs X_s = (1-s) X_t + s X_{t+1} at continuous
+time t_s = (l+s)/N. The velocity target is constant along the linear path,
+so the student sees a richer, smoother training signal.
+
+The student u_ω(X_s, t_s) is distilled to match these velocity targets, defining
 a Neural ODE: dX_t = u_ω(X_t, t) dt.
 
 Training stages:
@@ -228,7 +234,7 @@ class DistillFlowModule(LightningModule):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute velocity matching loss via Flow Recompilation.
+        """Compute velocity matching loss via Flow Recompilation with interpolation.
 
         Each transformer layer is a discrete ODE step:
             X_{t+1} = FM_θ^(t)(X_t)
@@ -236,11 +242,18 @@ class DistillFlowModule(LightningModule):
         The velocity target at step l is:
             v_target = (X_{l+1} - X_l) / Δt
 
-        where Δt = 1 / num_steps, and time t_l = l / num_steps (normalized to [0,1]
-        within the replaced layer range).
+        During training, we apply *conditional flow matching* within each layer
+        interval: instead of only querying the student at layer boundaries X_l,
+        we sample a random interpolation factor s ~ U(0,1) and construct:
+            X_s = (1 - s) * X_l + s * X_{l+1}
+            t_s = (l + s) / num_steps          (continuous time in [0, 1])
 
-        The student u_ω(X_t, t) is trained to match:
-            loss = MSE(u_ω(X_l, t_l), v_target)
+        The velocity target remains (X_{l+1} - X_l) / Δt (constant along the
+        linear path). This exposes the student to continuous inputs along each
+        segment, making learning significantly easier.
+
+        At evaluation time, s = 0 (i.e., we evaluate at exact layer boundaries)
+        to match the Euler-integration inference path.
         """
         from_l = self.hparams.from_layer
         to_l = self.hparams.to_layer
@@ -257,19 +270,29 @@ class DistillFlowModule(LightningModule):
             # X_{t+1}: teacher hidden state at output of this layer
             X_t1 = x_t_teacher[layer_idx + 1].detach()
 
-            # Velocity target: (X_{t+1} - X_t) / Δt
+            # Velocity target: (X_{t+1} - X_t) / Δt  (constant along the path)
             velocity_target = (X_t1 - X_t) / delta_t
 
-            # Normalized time for this step: t ∈ [0, 1)
-            t = torch.full(
-                (X_t.shape[0],),
-                step * delta_t,
-                device=X_t.device,
-                dtype=X_t.dtype,
-            )
+            # --- Interpolation (CFM within each layer interval) ---
+            if self.training:
+                # Sample s ~ U(0, 1) per sample in the batch
+                s = torch.rand(X_t.shape[0], 1, 1, device=X_t.device, dtype=X_t.dtype)
+                # Interpolated state: X_s = (1 - s) * X_t + s * X_{t+1}
+                X_s = (1.0 - s) * X_t + s * X_t1
+                # Continuous time: t_s = (step + s) * delta_t  ∈ [step/N, (step+1)/N)
+                t = (step + s.squeeze(-1).squeeze(-1)) * delta_t
+            else:
+                # At eval, query at exact layer boundaries (matches Euler integration)
+                X_s = X_t
+                t = torch.full(
+                    (X_t.shape[0],),
+                    step * delta_t,
+                    device=X_t.device,
+                    dtype=X_t.dtype,
+                )
 
-            # Predict velocity: u_ω(X_t, t)
-            v_pred = self.student.predict_velocity(X_t, t)
+            # Predict velocity: u_ω(X_s, t_s)
+            v_pred = self.student.predict_velocity(X_s, t)
 
             # MSE loss
             total_loss += self.mse_loss(v_pred, velocity_target)
