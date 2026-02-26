@@ -38,8 +38,8 @@ model:
   dit_depth: 2
   mlp_ratio: 4.0
   dropout: 0.1
-  learning_rate: 1e-4
-  lr_stage2: 1e-5
+  learning_rate: 1e-3
+  lr_stage2: 1e-4
   weight_decay: 0.01
   epochs_stage1: 15
   lambda_flow: 1.0
