@@ -315,8 +315,8 @@ class HookedQwen2DecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (hidden_states, residual_mid) for distillation compatibility."""
+    ) -> torch.Tensor:
+        """Returns hidden_states (post-full-block) for distillation."""
         # Hook: pre-residual
         residual = hidden_states
         residual = self.hook_resid_pre(residual)
@@ -340,9 +340,6 @@ class HookedQwen2DecoderLayer(nn.Module):
         # Hook: mid-residual (after attention, before MLP)
         hidden_states = self.hook_resid_mid(hidden_states)
 
-        # Store the post-attention residual for distillation targets
-        residual_mid = hidden_states
-
         # LayerNorm + MLP
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -355,7 +352,7 @@ class HookedQwen2DecoderLayer(nn.Module):
         # Hook: post-residual (final output)
         hidden_states = self.hook_resid_post(hidden_states)
 
-        return hidden_states, residual_mid
+        return hidden_states
 
 
 # =============================================================================
@@ -476,7 +473,6 @@ class HookedQwen2Model(HookedQwen2PreTrainedModel, HookedRootModule):
 
         # Collect trajectories for distillation
         x_t: List[torch.Tensor] = []
-        means: List[torch.Tensor] = []
 
         hidden_states = inputs_embeds
         x_t.append(hidden_states)  # x_t[0] = embeddings
@@ -488,7 +484,7 @@ class HookedQwen2Model(HookedQwen2PreTrainedModel, HookedRootModule):
                 getattr(decoder_layer, "attention_type", "full_attention"),
                 causal_mask_mapping["full_attention"],
             )
-            hidden_states, residual_mid = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=layer_mask,
                 position_ids=position_ids,
@@ -499,13 +495,12 @@ class HookedQwen2Model(HookedQwen2PreTrainedModel, HookedRootModule):
                 **kwargs,
             )
             x_t.append(hidden_states)  # x_t[i+1] = output after layer i
-            means.append(residual_mid)  # means[i] = post-attn residual
 
         hidden_states = self.norm(hidden_states)
         past_key_values = past_key_values if use_cache else None
 
         if return_hidden_trajectory:
-            return past_key_values, hidden_states, x_t, means
+            return past_key_values, hidden_states, x_t
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -567,12 +562,12 @@ class HookedQwen2ForSequenceClassification(HookedQwen2PreTrainedModel, HookedRoo
 
         Returns:
             If return_hidden_trajectory=True:
-                (logits, x_t, means) where x_t and means are lists of hidden states
+                (logits, x_t) where x_t is a list of per-layer hidden states
             Otherwise:
                 SequenceClassifierOutputWithPast
         """
         if return_hidden_trajectory:
-            past_kv, last_hidden, x_t, means = self.model(
+            past_kv, last_hidden, x_t = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -588,7 +583,7 @@ class HookedQwen2ForSequenceClassification(HookedQwen2PreTrainedModel, HookedRoo
             pooled_logits = logits[
                 torch.arange(batch_size, device=logits.device), last_idx
             ]
-            return pooled_logits, x_t, means
+            return pooled_logits, x_t
 
         # Standard forward
         outputs = self.model(

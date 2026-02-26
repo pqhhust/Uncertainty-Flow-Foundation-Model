@@ -1,8 +1,15 @@
 """Distillation LightningModule: distill fine-tuned Qwen2 into a flow-based model.
 
-Uses continuous flow matching (CondOTProbPath) to learn a velocity field that
-maps noise → teacher's intermediate hidden states. The training follows a
-two-stage approach:
+Uses Flow Recompilation to learn a continuous velocity field from the teacher's
+discrete layer-wise forward pass. Each transformer layer is viewed as a
+discretized ODE step:
+    X_{t+1} = FM_θ^(t)(X_t)
+    velocity_target = (X_{t+1} - X_t) / Δt
+
+The student u_ω(X_t, t) is distilled to match these velocity targets, defining
+a Neural ODE: dX_t = u_ω(X_t, t) dt.
+
+Training stages:
   - Stage 1: Velocity matching loss (MSE between predicted and target velocity)
   - Stage 2: Cross-entropy loss on classification labels (freeze flow, unfreeze suffix)
 """
@@ -11,11 +18,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning import LightningModule
 from torchmetrics import MeanMetric, MaxMetric
 from torchmetrics.classification import Accuracy
-
-from flow_matching.path import CondOTProbPath
 
 from src.models.components.hooked_qwen2 import (
     HookedQwen2ForSequenceClassification,
@@ -25,18 +31,18 @@ from src.models.components.flow_transformer import FlowTransformerText
 
 
 class DistillFlowModule(LightningModule):
-    """LightningModule for distilling a fine-tuned Qwen2 into a flow-based model.
+    """LightningModule for distilling a fine-tuned Qwen2 via Flow Recompilation.
 
-    The teacher (HookedQwen2ForSequenceClassification) is frozen and used to
-    extract hidden-state trajectories. The student (FlowTransformerText) learns
-    to reproduce these trajectories via continuous OT flow matching.
+    The teacher (HookedQwen2ForSequenceClassification) is treated as a discretized
+    ODE: each layer l maps X_l → X_{l+1} = FM_θ^(l)(X_l). The velocity target at
+    layer l is (X_{l+1} - X_l) / Δt. The student (FlowTransformerText) learns the
+    continuous velocity field u_ω(X_t, t) via MSE matching.
 
     Training stages:
         Stage 1 (epochs < epochs_stage1): Velocity matching loss only.
-            Train the DiT backbone + velocity head to predict the OT velocity
-            that transforms noise into teacher hidden states.
+            Train DiT + velocity head to predict layer-wise velocity targets.
         Stage 2 (epochs >= epochs_stage1): Cross-entropy loss only.
-            Freeze flow components, unfreeze suffix + classifier, fine-tune on labels.
+            Freeze flow, unfreeze suffix + classifier, fine-tune on labels.
     """
 
     def __init__(
@@ -49,6 +55,7 @@ class DistillFlowModule(LightningModule):
         dit_depth: int = 2,
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
+        teacher_dropout: float = 0.1,
         learning_rate: float = 1e-4,
         lr_stage2: float = 1e-5,
         weight_decay: float = 0.01,
@@ -83,9 +90,6 @@ class DistillFlowModule(LightningModule):
 
         # Start in Stage 1: freeze non-flow params
         self.student.freeze_non_flow_params()
-
-        # --- Flow matching path ---
-        self.flow_path = CondOTProbPath()
 
         # --- Losses ---
         self.mse_loss = nn.MSELoss()
@@ -156,14 +160,23 @@ class DistillFlowModule(LightningModule):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ):
-        """Extract teacher's hidden-state trajectory."""
+        """Extract teacher's hidden-state trajectory with dropout.
+
+        Per the Flow Recompilation formulation, we run the teacher with dropout
+        enabled (FM_{θ_dropout}) so velocity targets are stochastic, acting as
+        data augmentation / regularization.
+        """
+        p = self.hparams.teacher_dropout
         with torch.no_grad():
-            _, x_t, means = self.teacher(
+            _, x_t = self.teacher(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_hidden_trajectory=True,
             )
-        return x_t, means
+        if p > 0.0 and self.training:
+            # Apply dropout to each hidden state (stochastic velocity targets)
+            x_t = [F.dropout(h, p=p, training=True) for h in x_t]
+        return x_t
 
     def _compute_flow_loss(
         self,
@@ -171,48 +184,51 @@ class DistillFlowModule(LightningModule):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute velocity matching loss using CondOTProbPath.
+        """Compute velocity matching loss via Flow Recompilation.
 
-        For each replaced layer l (from_layer to to_layer-1):
-          - x_1 = teacher hidden state at layer l+1 (target)
-          - x_0 ~ N(0, I) (noise)
-          - t ~ U[0, 1]
-          - x_t = (1-t)*x_0 + t*x_1 (OT interpolant)
-          - target velocity = x_1 - x_0
-          - loss = MSE(v_θ(x_t, t), x_1 - x_0)
+        Each transformer layer is a discrete ODE step:
+            X_{t+1} = FM_θ^(t)(X_t)
+
+        The velocity target at step l is:
+            v_target = (X_{l+1} - X_l) / Δt
+
+        where Δt = 1 / num_steps, and time t_l = l / num_steps (normalized to [0,1]
+        within the replaced layer range).
+
+        The student u_ω(X_t, t) is trained to match:
+            loss = MSE(u_ω(X_l, t_l), v_target)
         """
         from_l = self.hparams.from_layer
         to_l = self.hparams.to_layer
+        num_steps = to_l - from_l
+        delta_t = 1.0 / num_steps
 
         total_loss = 0.0
-        num_steps = to_l - from_l
 
         for step in range(num_steps):
             layer_idx = from_l + step
 
-            # x_1: teacher hidden state at this layer (target)
-            x_1 = x_t_teacher[layer_idx + 1].detach()  # x_t[layer_idx+1] = output after layer_idx
+            # X_t: teacher hidden state at input of this layer
+            X_t = x_t_teacher[layer_idx].detach()
+            # X_{t+1}: teacher hidden state at output of this layer
+            X_t1 = x_t_teacher[layer_idx + 1].detach()
 
-            # x_0: noise from standard normal
-            x_0 = torch.randn_like(x_1)
+            # Velocity target: (X_{t+1} - X_t) / Δt
+            velocity_target = (X_t1 - X_t) / delta_t
 
-            # Sample t ~ U[0,1]
-            t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
-
-            # CondOTProbPath: x_t = (1-t)*x_0 + t*x_1, dx_t = x_1 - x_0
-            path_sample = self.flow_path.sample(t=t, x_0=x_0, x_1=x_1)
-
-            # Predict velocity
-            t_step = torch.full(
-                (x_1.shape[0],),
-                step / num_steps,  # Normalized timestep for this step
-                device=x_1.device,
-                dtype=x_1.dtype,
+            # Normalized time for this step: t ∈ [0, 1)
+            t = torch.full(
+                (X_t.shape[0],),
+                step * delta_t,
+                device=X_t.device,
+                dtype=X_t.dtype,
             )
-            v_pred = self.student.predict_velocity(path_sample.x_t, t_step)
 
-            # Velocity matching loss
-            total_loss += self.mse_loss(v_pred, path_sample.dx_t)
+            # Predict velocity: u_ω(X_t, t)
+            v_pred = self.student.predict_velocity(X_t, t)
+
+            # MSE loss
+            total_loss += self.mse_loss(v_pred, velocity_target)
 
         return total_loss / num_steps
 
@@ -228,7 +244,7 @@ class DistillFlowModule(LightningModule):
 
         if epochs_stage1 is not None and epoch < epochs_stage1:
             # Stage 1: Velocity matching loss only
-            x_t_teacher, means_teacher = self._get_teacher_trajectory(
+            x_t_teacher = self._get_teacher_trajectory(
                 input_ids, attention_mask
             )
             flow_loss = self._compute_flow_loss(x_t_teacher, input_ids, attention_mask)
@@ -255,7 +271,7 @@ class DistillFlowModule(LightningModule):
 
         else:
             # Joint: both losses
-            x_t_teacher, means_teacher = self._get_teacher_trajectory(
+            x_t_teacher = self._get_teacher_trajectory(
                 input_ids, attention_mask
             )
             flow_loss = self._compute_flow_loss(x_t_teacher, input_ids, attention_mask)

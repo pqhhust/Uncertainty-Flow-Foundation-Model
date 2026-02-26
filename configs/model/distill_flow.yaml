@@ -8,6 +8,7 @@ to_layer: 18
 dit_depth: 2
 mlp_ratio: 4.0
 dropout: 0.1
+teacher_dropout: 0.1  # Dropout on teacher hidden states (stochastic velocity targets)
 learning_rate: 1e-4
 lr_stage2: 1e-5
 weight_decay: 0.01

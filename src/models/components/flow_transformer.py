@@ -1,12 +1,17 @@
-"""Flow Transformer Text model for distillation.
+"""Flow Transformer Text model for distillation via Flow Recompilation.
 
-Replaces TransDiff's Diffusion_Transformer_Text with a flow-matching equivalent.
-Instead of predicting (mean, std) for a diagonal Gaussian, this model predicts
-a velocity field v_θ(x_t, t) for the continuous OT flow matching framework.
+Each transformer layer is viewed as a discrete ODE step:
+    X_{t+1} = FM_θ^(t)(X_t)
+
+The velocity field u_ω(X_t, t) is distilled from the teacher's layer residuals:
+    u_ω(X_t, t) <-- (FM_θ^(t)(X_t) - X_t) / Δt
+
+At inference, the replaced layers are substituted with Euler integration of the
+learned Neural ODE: dX_t = u_ω(X_t, t) dt.
 
 Architecture:
   - Frozen prefix: first `from_layer` Qwen2 decoder layers (copied from teacher)
-  - Flow block: shared DiT backbone applied `num_steps` times, predicting velocity
+  - Flow block: shared DiT backbone predicting velocity u_ω(X_t, t)
   - Frozen suffix: layers `to_layer` onward + classification head (from teacher)
 """
 
@@ -19,7 +24,6 @@ from transformers import Qwen2Model
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2DecoderLayer,
-    Qwen2MLP,
     Qwen2RMSNorm,
 )
 from transformers.masking_utils import create_causal_mask
@@ -28,11 +32,11 @@ from src.models.components.dit import DiT
 
 
 class FlowTransformerText(nn.Module):
-    """Flow-matching student model for distilling a fine-tuned Qwen2.
+    """Flow Recompilation student model for distilling a fine-tuned Qwen2.
 
-    The architecture mirrors TransDiff's Diffusion_Transformer_Text but replaces
-    the Gaussian (mean,std) prediction with velocity field prediction for
-    continuous flow matching.
+    Views the teacher's layers as a discretized ODE and learns a continuous
+    velocity field u_ω(X_t, t) to replace the middle layers. During inference,
+    Euler integration of dX_t = u_ω(X_t, t) dt replaces the discrete layers.
 
     Args:
         config: Qwen2Config from the teacher model
@@ -94,12 +98,6 @@ class FlowTransformerText(nn.Module):
         )
 
         # --- Frozen suffix components ---
-        # MLP from the last replaced layer (for the transition from flow → suffix)
-        self.transition_mlp = Qwen2MLP(config)
-        self.transition_layernorm = Qwen2RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
         # Suffix decoder layers: to_layer → end
         self.suffix_layers = nn.ModuleList(
             [
@@ -113,11 +111,11 @@ class FlowTransformerText(nn.Module):
         self.score = nn.Linear(config.hidden_size, num_labels, bias=False)
 
     def predict_velocity(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Predict velocity field v_θ(x_t, t).
+        """Predict velocity field u_ω(X_t, t).
 
         Args:
-            x: (B, S, D) noisy hidden states at time t
-            t: (B,) timestep values
+            x: (B, S, D) hidden states at time t
+            t: (B,) timestep values in [0, 1)
 
         Returns:
             (B, S, D) predicted velocity
@@ -129,14 +127,20 @@ class FlowTransformerText(nn.Module):
     def flow_forward(
         self, x_start: torch.Tensor, num_steps: Optional[int] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Run the flow steps (Euler integration) during inference.
+        """Solve the Neural ODE via Euler integration: dX_t = u_ω(X_t, t) dt.
+
+        Integrates from t=0 to t=1 in `num_steps` Euler steps, replacing the
+        teacher's discrete layers [from_layer, to_layer) with the continuous
+        flow model.
 
         Args:
-            x_start: (B, S, D) starting hidden state (output of prefix)
-            num_steps: Number of Euler steps (defaults to self.num_steps)
+            x_start: (B, S, D) starting hidden state (output of prefix, i.e., X_{from_layer})
+            num_steps: Number of Euler steps (defaults to self.num_steps = to_layer - from_layer)
 
         Returns:
-            (final_x, velocities) where velocities is a list of predicted v at each step
+            (final_x, velocities) where:
+                final_x: (B, S, D) hidden state at t=1 (approximates X_{to_layer})
+                velocities: list of predicted velocities at each step
         """
         if num_steps is None:
             num_steps = self.num_steps
@@ -210,10 +214,8 @@ class FlowTransformerText(nn.Module):
         # 2. Run flow steps (replace layers from_layer to to_layer-1)
         x, velocities = self.flow_forward(x)
 
-        # 3. Transition: apply MLP + residual from last replaced layer
-        x_layer = x + self.transition_mlp(self.transition_layernorm(x))
-
-        # 4. Run frozen suffix layers
+        # 3. Run frozen suffix layers
+        x_layer = x
         mask_kwargs = {
             "config": self.config,
             "input_embeds": inputs_embeds,
@@ -240,7 +242,7 @@ class FlowTransformerText(nn.Module):
             if isinstance(x_layer, tuple):
                 x_layer = x_layer[0]
 
-        # 5. Classify: pool on last non-pad token
+        # 4. Classify: pool on last non-pad token
         batch_size = x_layer.shape[0]
         logits = self.score(self.norm(x_layer))
 
@@ -266,7 +268,6 @@ class FlowTransformerText(nn.Module):
 
         Copies:
           - Prefix layers (embed_tokens, rotary_emb, layers 0..from_layer-1)
-          - Transition MLP + LayerNorm from the last replaced layer
           - Suffix layers (to_layer..end)
           - Final norm and classification head
         """
@@ -317,31 +318,16 @@ class FlowTransformerText(nn.Module):
                 src_layer.post_attention_layernorm.weight.data
             )
 
-        # 4. Transition MLP from the to_layer-1 (last replaced layer)
-        last_replaced = teacher_base.layers[self.to_layer - 1]
-        self.transition_mlp.gate_proj.load_state_dict(
-            last_replaced.mlp.gate_proj.state_dict()
-        )
-        self.transition_mlp.up_proj.load_state_dict(
-            last_replaced.mlp.up_proj.state_dict()
-        )
-        self.transition_mlp.down_proj.load_state_dict(
-            last_replaced.mlp.down_proj.state_dict()
-        )
-        self.transition_layernorm.weight.data.copy_(
-            last_replaced.post_attention_layernorm.weight.data
-        )
-
-        # 5. Suffix decoder layers
+        # 4. Suffix decoder layers
         for i in range(self.to_layer, self.num_layers):
             src_layer = teacher_base.layers[i]
             dst_layer = self.suffix_layers[i - self.to_layer]
             dst_layer.load_state_dict(src_layer.state_dict(), strict=False)
 
-        # 6. Final norm
+        # 5. Final norm
         self.norm.weight.data.copy_(teacher_base.norm.weight.data)
 
-        # 7. Classification head
+        # 6. Classification head
         self.score.load_state_dict(teacher_model.score.state_dict())
 
         print(
@@ -354,10 +340,6 @@ class FlowTransformerText(nn.Module):
     def freeze_non_flow_params(self) -> None:
         """Freeze everything except the DiT backbone and velocity head (Stage 1)."""
         for param in self.qwen_prefix.parameters():
-            param.requires_grad = False
-        for param in self.transition_mlp.parameters():
-            param.requires_grad = False
-        for param in self.transition_layernorm.parameters():
             param.requires_grad = False
         for param in self.suffix_layers.parameters():
             param.requires_grad = False
@@ -380,10 +362,6 @@ class FlowTransformerText(nn.Module):
             param.requires_grad = False
 
         # Unfreeze suffix
-        for param in self.transition_mlp.parameters():
-            param.requires_grad = True
-        for param in self.transition_layernorm.parameters():
-            param.requires_grad = True
         for param in self.suffix_layers.parameters():
             param.requires_grad = True
         for param in self.norm.parameters():
