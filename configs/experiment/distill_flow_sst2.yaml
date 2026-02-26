@@ -15,17 +15,19 @@ seed: 42
 
 trainer:
   min_epochs: 1
-  max_epochs: 30
-  gradient_clip_val: 1.0
-  precision: "bf16-mixed"
-  accumulate_grad_batches: 2
+  max_epochs: 20
+  # gradient_clip_val: 1.0
+  precision: "32"
+  # accumulate_grad_batches: 1
+  devices: 2
+  strategy: "ddp_find_unused_parameters_true"
 
 data:
   task_name: "sst2"
   model_name: "Qwen/Qwen2.5-0.5B"
   max_length: 128
-  batch_size: 16
-  num_workers: 4
+  batch_size: 64
+  num_workers: 16
 
 model:
   model_name: "Qwen/Qwen2.5-0.5B"

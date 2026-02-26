@@ -15,10 +15,12 @@ seed: 42
 
 trainer:
   min_epochs: 1
-  max_epochs: 3
-  gradient_clip_val: 1.0
-  precision: "bf16-mixed"
-  accumulate_grad_batches: 2
+  max_epochs: 5
+  # gradient_clip_val: 1.0
+  precision: "32"
+  # accumulate_grad_batches: 2
+  devices: 2
+  # strategy: "ddp_find_unused_parameters_true"
 
 data:
   task_name: "sst2"

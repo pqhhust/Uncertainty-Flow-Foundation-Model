@@ -128,17 +128,55 @@ class DistillFlowModule(LightningModule):
         num_labels: int,
         ckpt_path: Optional[str],
     ) -> HookedQwen2ForSequenceClassification:
-        """Load teacher model from checkpoint or pretrained."""
-        if ckpt_path is not None:
-            # Load from Lightning checkpoint
-            from src.models.qwen2_finetune_module import Qwen2FineTuneModule
+        """Load teacher model from checkpoint or pretrained.
 
-            finetune_module = Qwen2FineTuneModule.load_from_checkpoint(
-                ckpt_path,
-                map_location="cpu",
-            )
-            teacher = finetune_module.net
-            del finetune_module
+        When loading from a checkpoint, directly reconstruct from config +
+        state dict to avoid redundantly downloading pretrained HuggingFace
+        weights (which load_from_checkpoint would trigger via __init__).
+        """
+        if ckpt_path is not None:
+            import torch as _torch
+            from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+
+            ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            hparams = ckpt.get("hyper_parameters", {})
+            ckpt_model_name = hparams.get("model_name", model_name)
+            ckpt_num_labels = hparams.get("num_labels", num_labels)
+            finetune_mode = hparams.get("finetune_mode", "full")
+
+            # Build model structure from config (use local cache, no network call)
+            config = Qwen2Config.from_pretrained(ckpt_model_name, local_files_only=True)
+            config.num_labels = ckpt_num_labels
+            config.pad_token_id = config.eos_token_id
+            teacher = HookedQwen2ForSequenceClassification(config)
+
+            if finetune_mode == "lora":
+                # Re-apply LoRA structure so state dict keys match
+                from peft import LoraConfig, get_peft_model, PeftModel
+                lora_config = LoraConfig(
+                    r=hparams.get("lora_r", 8),
+                    lora_alpha=hparams.get("lora_alpha", 16),
+                    lora_dropout=hparams.get("lora_dropout", 0.05),
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"],
+                    bias="none",
+                    task_type="SEQ_CLS",
+                )
+                teacher = get_peft_model(teacher, lora_config)
+                # Load checkpoint state dict (keys are prefixed with "net.")
+                state_dict = {k[len("net."):]: v
+                              for k, v in ckpt["state_dict"].items()
+                              if k.startswith("net.")}
+                teacher.load_state_dict(state_dict, strict=False)
+                # Merge LoRA weights into base and unwrap
+                teacher = teacher.merge_and_unload()
+            else:
+                state_dict = {k[len("net."):]: v
+                              for k, v in ckpt["state_dict"].items()
+                              if k.startswith("net.")}
+                teacher.load_state_dict(state_dict, strict=False)
+
+            del ckpt
         else:
             # Load pretrained (no fine-tuning)
             teacher = load_pretrained_hooked_qwen2(

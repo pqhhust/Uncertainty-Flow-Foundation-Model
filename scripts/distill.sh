@@ -7,7 +7,7 @@
 set -e
 
 TASK=${1:-sst2}
-TEACHER_CKPT=${2:-""}
+TEACHER_CKPT=${2:-"/home/user01/aiotlab/pqhung/uncertainty/Uncertainty-Flow-Foundation-Model/logs/train/runs/2026-02-26_14-04-20/checkpoints/last.ckpt"}
 
 if [ -z "$TEACHER_CKPT" ]; then
     echo "Error: teacher_ckpt is required"
@@ -22,12 +22,14 @@ echo "Teacher: ${TEACHER_CKPT}"
 echo "============================================"
 
 # Activate environment
-source activate uffm 2>/dev/null || conda activate uffm 2>/dev/null || true
+# source activate uffm 2>/dev/null || conda activate uffm 2>/dev/null || true
 
-cd "$(dirname "$0")/.."
+# cd "$(dirname "$0")/.."
 
 python src/train.py \
     experiment=distill_flow_${TASK} \
     model.teacher_ckpt_path="${TEACHER_CKPT}" \
     tags="[qwen2,${TASK},distill,flow]" \
+    logger=wandb \
+    logger.wandb.project="uffm" \
     "${@:3}"  # Pass any additional Hydra overrides (args after task and ckpt)
