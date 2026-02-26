@@ -62,6 +62,8 @@ class DistillFlowModule(LightningModule):
         mlp_ratio: float = 4.0,
         dropout: float = 0.1,
         teacher_dropout: float = 0.1,
+        scale_div: float = 1.0,
+        use_interpolation: bool = False,
         learning_rate: float = 1e-4,
         lr_stage2: float = 1e-5,
         weight_decay: float = 0.01,
@@ -89,6 +91,7 @@ class DistillFlowModule(LightningModule):
             num_labels=num_labels,
             from_layer=from_layer,
             to_layer=to_layer,
+            scale_div=scale_div,
         )
 
         # Transfer teacher weights to student
@@ -259,6 +262,7 @@ class DistillFlowModule(LightningModule):
         to_l = self.hparams.to_layer
         num_steps = to_l - from_l
         delta_t = 1.0 / num_steps
+        scale_div = self.hparams.scale_div
 
         total_loss = 0.0
 
@@ -270,20 +274,25 @@ class DistillFlowModule(LightningModule):
             # X_{t+1}: teacher hidden state at output of this layer
             X_t1 = x_t_teacher[layer_idx + 1].detach()
 
-            # Velocity target: (X_{t+1} - X_t) / Δt  (constant along the path)
-            velocity_target = (X_t1 - X_t) / delta_t
+            # --- Normalize to stabilize training ---
+            # Work in scaled space: X̃ = X / scale_div
+            X_t_n = X_t / scale_div
+            X_t1_n = X_t1 / scale_div
+
+            # Velocity target in normalized space: (X̃_{t+1} - X̃_t) / Δt
+            velocity_target = (X_t1_n - X_t_n) / delta_t
 
             # --- Interpolation (CFM within each layer interval) ---
-            if self.training:
+            if self.training and self.hparams.use_interpolation:
                 # Sample s ~ U(0, 1) per sample in the batch
                 s = torch.rand(X_t.shape[0], 1, 1, device=X_t.device, dtype=X_t.dtype)
-                # Interpolated state: X_s = (1 - s) * X_t + s * X_{t+1}
-                X_s = (1.0 - s) * X_t + s * X_t1
+                # Interpolated state in normalized space
+                X_s = (1.0 - s) * X_t_n + s * X_t1_n
                 # Continuous time: t_s = (step + s) * delta_t  ∈ [step/N, (step+1)/N)
                 t = (step + s.squeeze(-1).squeeze(-1)) * delta_t
             else:
-                # At eval, query at exact layer boundaries (matches Euler integration)
-                X_s = X_t
+                # No interpolation: query at exact layer boundaries
+                X_s = X_t_n
                 t = torch.full(
                     (X_t.shape[0],),
                     step * delta_t,
@@ -291,10 +300,10 @@ class DistillFlowModule(LightningModule):
                     dtype=X_t.dtype,
                 )
 
-            # Predict velocity: u_ω(X_s, t_s)
+            # Predict velocity in normalized space: u_ω(X̃_s, t_s)
             v_pred = self.student.predict_velocity(X_s, t)
 
-            # MSE loss
+            # MSE loss (both v_pred and velocity_target in normalized space)
             total_loss += self.mse_loss(v_pred, velocity_target)
 
         return total_loss / num_steps

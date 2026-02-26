@@ -9,6 +9,8 @@ dit_depth: 2
 mlp_ratio: 4.0
 dropout: 0.1
 teacher_dropout: 0.1  # Dropout on teacher hidden states (stochastic velocity targets)
+scale_div: 1.0  # Divide hidden states by this factor before flow matching (stabilizes training)
+use_interpolation: false  # CFM interpolation between layer boundaries (set true after baseline)
 learning_rate: 1e-4
 lr_stage2: 1e-5
 weight_decay: 0.01

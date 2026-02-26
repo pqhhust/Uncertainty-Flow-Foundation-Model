@@ -59,6 +59,7 @@ class FlowTransformerText(nn.Module):
         num_labels: int = 2,
         from_layer: int = 0,
         to_layer: int = 12,
+        scale_div: float = 1.0,
     ):
         super().__init__()
         # Ensure attention implementation is set (required by newer transformers)
@@ -70,6 +71,7 @@ class FlowTransformerText(nn.Module):
         self.from_layer = from_layer
         self.to_layer = to_layer
         self.num_steps = to_layer - from_layer
+        self.scale_div = scale_div
 
         if num_heads is None:
             num_heads = config.num_attention_heads
@@ -133,6 +135,9 @@ class FlowTransformerText(nn.Module):
         teacher's discrete layers [from_layer, to_layer) with the continuous
         flow model.
 
+        If scale_div > 1, integration is performed in normalized space
+        (X̃ = X / scale_div) and the result is scaled back.
+
         Args:
             x_start: (B, S, D) starting hidden state (output of prefix, i.e., X_{from_layer})
             num_steps: Number of Euler steps (defaults to self.num_steps = to_layer - from_layer)
@@ -145,7 +150,8 @@ class FlowTransformerText(nn.Module):
         if num_steps is None:
             num_steps = self.num_steps
 
-        x = x_start
+        # Work in normalized space: X̃ = X / scale_div
+        x = x_start / self.scale_div
         velocities = []
         dt = 1.0 / num_steps
 
@@ -155,8 +161,10 @@ class FlowTransformerText(nn.Module):
             )
             v = self.predict_velocity(x, t)
             velocities.append(v)
-            x = x + v * dt  # Euler step
+            x = x + v * dt  # Euler step in normalized space
 
+        # Scale back to original space
+        x = x * self.scale_div
         return x, velocities
 
     def forward(
