@@ -199,17 +199,43 @@ class Qwen2FineTuneModule(LightningModule):
         self._val_labels.append(targets.detach().cpu())
 
     def _gather_predictions(self, logits_list, labels_list):
-        """Gather logits/labels across GPUs (if distributed), then compute on full data."""
+        """Gather logits/labels across GPUs (if distributed), then compute on full data.
+
+        Handles uneven sample counts across GPUs by padding to the max local
+        count, gathering, then trimming padding via a count tensor.
+        """
         all_logits = torch.cat(logits_list, dim=0)
         all_labels = torch.cat(labels_list, dim=0)
 
-        # In distributed setting, gather all predictions to rank 0
         if self.trainer and self.trainer.world_size > 1:
-            gathered_logits = self.all_gather(all_logits.to(self.device))
-            gathered_labels = self.all_gather(all_labels.to(self.device))
-            # all_gather returns (world_size, local_N, ...) — flatten
-            all_logits = gathered_logits.reshape(-1, gathered_logits.shape[-1]).cpu()
-            all_labels = gathered_labels.reshape(-1).cpu()
+            device = self.device
+            local_n = torch.tensor([all_logits.shape[0]], device=device)
+            # Find max local count across all GPUs
+            max_n = self.all_gather(local_n).max().item()
+
+            # Pad to max_n so all_gather works with uniform shapes
+            pad_n = max_n - all_logits.shape[0]
+            if pad_n > 0:
+                all_logits = torch.cat(
+                    [all_logits, torch.zeros(pad_n, all_logits.shape[-1])], dim=0
+                )
+                all_labels = torch.cat(
+                    [all_labels, torch.zeros(pad_n, dtype=all_labels.dtype)], dim=0
+                )
+
+            gathered_logits = self.all_gather(all_logits.to(device))  # (W, max_n, K)
+            gathered_labels = self.all_gather(all_labels.to(device))  # (W, max_n)
+            gathered_counts = self.all_gather(local_n)                # (W, 1)
+
+            # Trim padding per GPU and concatenate
+            trimmed_logits = []
+            trimmed_labels = []
+            for i in range(self.trainer.world_size):
+                n = gathered_counts[i].item()
+                trimmed_logits.append(gathered_logits[i, :n])
+                trimmed_labels.append(gathered_labels[i, :n])
+            all_logits = torch.cat(trimmed_logits, dim=0).cpu()
+            all_labels = torch.cat(trimmed_labels, dim=0).cpu()
 
         return all_logits, all_labels
 
