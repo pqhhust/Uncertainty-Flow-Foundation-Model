@@ -36,6 +36,12 @@ model:
   weight_decay: 0.01
   warmup_steps: 100
 
+logger:
+  wandb:
+    name: "finetune_cola_lr${model.learning_rate}_ep${trainer.max_epochs}"
+    group: "finetune"
+    job_type: "finetune"
+
 callbacks:
   model_checkpoint:
     monitor: "val/matthews_correlation"

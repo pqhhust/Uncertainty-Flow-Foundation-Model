@@ -43,6 +43,12 @@ model:
   lambda_flow: 1.0
   lambda_ce: 1.0
 
+logger:
+  wandb:
+    name: "distill_cola_L${model.from_layer}-${model.to_layer}_dit${model.dit_depth}_lr${model.learning_rate}"
+    group: "distill"
+    job_type: "distill"
+
 callbacks:
   model_checkpoint:
     monitor: "val/accuracy"
