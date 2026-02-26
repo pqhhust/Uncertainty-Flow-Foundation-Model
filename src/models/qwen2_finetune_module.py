@@ -198,6 +198,21 @@ class Qwen2FineTuneModule(LightningModule):
         self._val_logits.append(logits.detach().cpu())
         self._val_labels.append(targets.detach().cpu())
 
+    def _gather_predictions(self, logits_list, labels_list):
+        """Gather logits/labels across GPUs (if distributed), then compute on full data."""
+        all_logits = torch.cat(logits_list, dim=0)
+        all_labels = torch.cat(labels_list, dim=0)
+
+        # In distributed setting, gather all predictions to rank 0
+        if self.trainer and self.trainer.world_size > 1:
+            gathered_logits = self.all_gather(all_logits.to(self.device))
+            gathered_labels = self.all_gather(all_labels.to(self.device))
+            # all_gather returns (world_size, local_N, ...) — flatten
+            all_logits = gathered_logits.reshape(-1, gathered_logits.shape[-1]).cpu()
+            all_labels = gathered_labels.reshape(-1).cpu()
+
+        return all_logits, all_labels
+
     def on_validation_epoch_end(self) -> None:
         metric_val = self.val_metric.compute()
         self.val_metric_best(metric_val)
@@ -207,11 +222,12 @@ class Qwen2FineTuneModule(LightningModule):
         if self._val_logits and self.hparams.num_labels > 1:
             from src.utils.metrics import compute_all_metrics
 
-            all_logits = torch.cat(self._val_logits, dim=0)
-            all_labels = torch.cat(self._val_labels, dim=0)
+            all_logits, all_labels = self._gather_predictions(
+                self._val_logits, self._val_labels
+            )
             metrics = compute_all_metrics(all_logits, all_labels)
             for k, v in metrics.items():
-                self.log(f"val/{k}", v, on_step=False, on_epoch=True)
+                self.log(f"val/{k}", v, on_step=False, on_epoch=True, rank_zero_only=True)
 
         self._val_logits.clear()
         self._val_labels.clear()
@@ -238,13 +254,14 @@ class Qwen2FineTuneModule(LightningModule):
             plot_reliability_diagram,
         )
 
-        all_logits = torch.cat(self._test_logits, dim=0)
-        all_labels = torch.cat(self._test_labels, dim=0)
+        all_logits, all_labels = self._gather_predictions(
+            self._test_logits, self._test_labels
+        )
 
         # Scalar metrics
         metrics = compute_all_metrics(all_logits, all_labels)
         for k, v in metrics.items():
-            self.log(f"test/{k}", v, on_step=False, on_epoch=True)
+            self.log(f"test/{k}", v, on_step=False, on_epoch=True, rank_zero_only=True)
 
         self.print(f"\n{'='*60}")
         self.print("Test Calibration Metrics (TransDiff-style):")
