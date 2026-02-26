@@ -116,6 +116,12 @@ class DistillFlowModule(LightningModule):
         # Stage tracking
         self._current_stage = 1
 
+        # Collect logits/labels for calibration metrics
+        self._test_logits: List[torch.Tensor] = []
+        self._test_labels: List[torch.Tensor] = []
+        self._val_logits: List[torch.Tensor] = []
+        self._val_labels: List[torch.Tensor] = []
+
     def _load_teacher(
         self,
         model_name: str,
@@ -307,10 +313,27 @@ class DistillFlowModule(LightningModule):
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val/accuracy", self.val_acc, on_step=False, on_epoch=True, prog_bar=True)
 
+        # Collect for calibration
+        self._val_logits.append(pooled_logits.detach().cpu())
+        self._val_labels.append(labels.detach().cpu())
+
     def on_validation_epoch_end(self) -> None:
         acc = self.val_acc.compute()
         self.val_acc_best(acc)
         self.log("val/accuracy_best", self.val_acc_best.compute(), sync_dist=True, prog_bar=True)
+
+        # Compute calibration metrics on validation set
+        if self._val_logits:
+            from src.utils.metrics import compute_all_metrics
+
+            all_logits = torch.cat(self._val_logits, dim=0)
+            all_labels = torch.cat(self._val_labels, dim=0)
+            metrics = compute_all_metrics(all_logits, all_labels)
+            for k, v in metrics.items():
+                self.log(f"val/{k}", v, on_step=False, on_epoch=True)
+
+        self._val_logits.clear()
+        self._val_labels.clear()
 
     def test_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -324,6 +347,46 @@ class DistillFlowModule(LightningModule):
 
         self.test_acc(preds, labels)
         self.log("test/accuracy", self.test_acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Collect for calibration
+        self._test_logits.append(pooled_logits.detach().cpu())
+        self._test_labels.append(labels.detach().cpu())
+
+    def on_test_epoch_end(self) -> None:
+        """Compute full calibration metrics and plot reliability diagrams."""
+        if not self._test_logits:
+            return
+
+        from src.utils.metrics import (
+            compute_all_metrics,
+            format_metrics_table,
+            plot_reliability_diagram,
+        )
+
+        all_logits = torch.cat(self._test_logits, dim=0)
+        all_labels = torch.cat(self._test_labels, dim=0)
+
+        # Scalar metrics
+        metrics = compute_all_metrics(all_logits, all_labels)
+        for k, v in metrics.items():
+            self.log(f"test/{k}", v, on_step=False, on_epoch=True)
+
+        self.print(f"\n{'='*60}")
+        self.print("Test Calibration Metrics (TransDiff-style):")
+        self.print(format_metrics_table(metrics))
+        self.print(f"{'='*60}\n")
+
+        # Reliability diagram + bin-count plot
+        save_dir = "."
+        if self.trainer and self.trainer.log_dir:
+            save_dir = self.trainer.log_dir
+        plot_metrics = plot_reliability_diagram(
+            all_logits, all_labels, save_dir=save_dir, split="test"
+        )
+        self.print(f"Reliability diagram saved to {save_dir}/calibration/")
+
+        self._test_logits.clear()
+        self._test_labels.clear()
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Configure optimizer — only optimizes trainable params."""

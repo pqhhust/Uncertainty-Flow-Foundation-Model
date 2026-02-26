@@ -6,7 +6,7 @@ Supports three fine-tuning modes:
   - linear_probe: freeze all except the classification head
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from lightning import LightningModule
@@ -92,6 +92,12 @@ class Qwen2FineTuneModule(LightningModule):
         # Best validation metric
         self.val_metric_best = MaxMetric()
 
+        # Collect logits/labels for calibration metrics
+        self._test_logits: List[torch.Tensor] = []
+        self._test_labels: List[torch.Tensor] = []
+        self._val_logits: List[torch.Tensor] = []
+        self._val_labels: List[torch.Tensor] = []
+
     def _apply_finetune_mode(self, mode: str) -> None:
         """Configure which parameters are trainable based on fine-tuning mode."""
         if mode == "linear_probe":
@@ -166,7 +172,7 @@ class Qwen2FineTuneModule(LightningModule):
         else:
             preds = torch.argmax(logits, dim=-1)
 
-        return loss, preds, labels
+        return loss, preds, labels, logits
 
     def on_train_start(self) -> None:
         self.val_loss.reset()
@@ -174,7 +180,7 @@ class Qwen2FineTuneModule(LightningModule):
         self.val_metric_best.reset()
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
-        loss, preds, targets = self.model_step(batch)
+        loss, preds, targets, _ = self.model_step(batch)
         self.train_loss(loss)
         self.train_metric(preds, targets)
         self.log("train/loss", self.train_loss, on_step=True, on_epoch=True, prog_bar=True)
@@ -182,23 +188,80 @@ class Qwen2FineTuneModule(LightningModule):
         return loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        loss, preds, targets = self.model_step(batch)
+        loss, preds, targets, logits = self.model_step(batch)
         self.val_loss(loss)
         self.val_metric(preds, targets)
         self.log("val/loss", self.val_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"val/{self.metric_name}", self.val_metric, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Collect logits for calibration
+        self._val_logits.append(logits.detach().cpu())
+        self._val_labels.append(targets.detach().cpu())
 
     def on_validation_epoch_end(self) -> None:
         metric_val = self.val_metric.compute()
         self.val_metric_best(metric_val)
         self.log(f"val/{self.metric_name}_best", self.val_metric_best.compute(), sync_dist=True, prog_bar=True)
 
+        # Compute calibration metrics on validation set
+        if self._val_logits and self.hparams.num_labels > 1:
+            from src.utils.metrics import compute_all_metrics
+
+            all_logits = torch.cat(self._val_logits, dim=0)
+            all_labels = torch.cat(self._val_labels, dim=0)
+            metrics = compute_all_metrics(all_logits, all_labels)
+            for k, v in metrics.items():
+                self.log(f"val/{k}", v, on_step=False, on_epoch=True)
+
+        self._val_logits.clear()
+        self._val_labels.clear()
+
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        loss, preds, targets = self.model_step(batch)
+        loss, preds, targets, logits = self.model_step(batch)
         self.test_loss(loss)
         self.test_metric(preds, targets)
         self.log("test/loss", self.test_loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log(f"test/{self.metric_name}", self.test_metric, on_step=False, on_epoch=True, prog_bar=True)
+
+        # Collect logits for calibration
+        self._test_logits.append(logits.detach().cpu())
+        self._test_labels.append(targets.detach().cpu())
+
+    def on_test_epoch_end(self) -> None:
+        """Compute full calibration metrics and plot reliability diagrams."""
+        if not self._test_logits or self.hparams.num_labels <= 1:
+            return
+
+        from src.utils.metrics import (
+            compute_all_metrics,
+            format_metrics_table,
+            plot_reliability_diagram,
+        )
+
+        all_logits = torch.cat(self._test_logits, dim=0)
+        all_labels = torch.cat(self._test_labels, dim=0)
+
+        # Scalar metrics
+        metrics = compute_all_metrics(all_logits, all_labels)
+        for k, v in metrics.items():
+            self.log(f"test/{k}", v, on_step=False, on_epoch=True)
+
+        self.print(f"\n{'='*60}")
+        self.print("Test Calibration Metrics (TransDiff-style):")
+        self.print(format_metrics_table(metrics))
+        self.print(f"{'='*60}\n")
+
+        # Reliability diagram + bin-count plot
+        save_dir = "."
+        if self.trainer and self.trainer.log_dir:
+            save_dir = self.trainer.log_dir
+        plot_reliability_diagram(
+            all_logits, all_labels, save_dir=save_dir, split="test"
+        )
+        self.print(f"Reliability diagram saved to {save_dir}/calibration/")
+
+        self._test_logits.clear()
+        self._test_labels.clear()
 
     def configure_optimizers(self) -> Dict[str, Any]:
         """Configure optimizer and optional LR scheduler."""
