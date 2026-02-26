@@ -10,7 +10,7 @@ hydra-colorlog==1.2.0
 hydra-optuna-sweeper==1.2.0
 
 # --------- transformers & datasets --------- #
-transformers>=4.40.0
+transformers==4.57.6
 datasets>=2.18.0
 evaluate>=0.4.0
 accelerate>=0.28.0
@@ -34,3 +34,5 @@ pre-commit      # hooks for applying linters on commit
 rich            # beautiful text formatting in terminal
 pytest          # tests
 timm            # for DiT attention/MLP blocks
+scikit-learn    # metrics (AUROC, AUPR, FPR@95, etc.)
+matplotlib      # reliability diagrams
