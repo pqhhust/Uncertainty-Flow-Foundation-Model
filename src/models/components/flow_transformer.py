@@ -3,15 +3,17 @@
 Each transformer layer is viewed as a discrete ODE step:
     X_{t+1} = FM_θ^(t)(X_t)
 
-The velocity field u_ω(X_t, t) is distilled from the teacher's layer residuals:
-    u_ω(X_t, t) <-- (FM_θ^(t)(X_t) - X_t) / Δt
+Supports two velocity prediction modes:
+  - "velocity": predict instantaneous velocity u_ω(X_t, t)
+  - "meanflow": predict mean velocity u_ω(X_t, t, h) over interval [t, t+h]
+    (MeanFlow, Geng et al. 2025), enabling adaptive-step and 1-step inference.
 
 At inference, the replaced layers are substituted with Euler integration of the
 learned Neural ODE: dX_t = u_ω(X_t, t) dt.
 
 Architecture:
   - Frozen prefix: first `from_layer` Qwen2 decoder layers (copied from teacher)
-  - Flow block: shared DiT backbone predicting velocity u_ω(X_t, t)
+  - Flow block: shared DiT backbone predicting velocity u_ω(X_t, t[, h])
   - Frozen suffix: layers `to_layer` onward + classification head (from teacher)
 """
 
@@ -60,6 +62,7 @@ class FlowTransformerText(nn.Module):
         from_layer: int = 0,
         to_layer: int = 12,
         scale_div: float = 1.0,
+        loss_type: str = "velocity",
     ):
         super().__init__()
         # Ensure attention implementation is set (required by newer transformers)
@@ -72,6 +75,7 @@ class FlowTransformerText(nn.Module):
         self.to_layer = to_layer
         self.num_steps = to_layer - from_layer
         self.scale_div = scale_div
+        self.loss_type = loss_type
 
         if num_heads is None:
             num_heads = config.num_attention_heads
@@ -83,11 +87,13 @@ class FlowTransformerText(nn.Module):
         self.qwen_prefix.norm = nn.Identity()  # Skip final norm in prefix
 
         # --- Flow block: shared DiT backbone ---
+        use_h_embedding = (loss_type == "meanflow")
         self.dit = DiT(
             hidden_size=self.d_model,
             depth=dit_depth,
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
+            use_h_embedding=use_h_embedding,
         )
 
         # Velocity prediction head: predicts v_θ(x_t, t)
@@ -112,17 +118,20 @@ class FlowTransformerText(nn.Module):
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.score = nn.Linear(config.hidden_size, num_labels, bias=False)
 
-    def predict_velocity(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Predict velocity field u_ω(X_t, t).
+    def predict_velocity(
+        self, x: torch.Tensor, t: torch.Tensor, h: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict velocity field u_ω(X_t, t[, h]).
 
         Args:
             x: (B, S, D) hidden states at time t
             t: (B,) timestep values in [0, 1)
+            h: (B,) interval width for MeanFlow (optional, default 0 = instantaneous)
 
         Returns:
-            (B, S, D) predicted velocity
+            (B, S, D) predicted velocity (instantaneous or mean, depending on h)
         """
-        dit_out = self.dit(x, t)
+        dit_out = self.dit(x, t, h=h)
         velocity = self.velocity_head(dit_out)
         return velocity
 
@@ -137,6 +146,9 @@ class FlowTransformerText(nn.Module):
 
         If scale_div > 1, integration is performed in normalized space
         (X̃ = X / scale_div) and the result is scaled back.
+
+        For MeanFlow mode, each step queries u_ω(x, t, h=dt) — the mean velocity
+        over the step interval. For standard mode, h is not passed.
 
         Args:
             x_start: (B, S, D) starting hidden state (output of prefix, i.e., X_{from_layer})
@@ -159,7 +171,9 @@ class FlowTransformerText(nn.Module):
             t = torch.full(
                 (x.shape[0],), step * dt, device=x.device, dtype=x.dtype
             )
-            v = self.predict_velocity(x, t)
+            # For MeanFlow: pass h=dt so the network predicts mean velocity over [t, t+dt]
+            h_val = torch.full_like(t, dt) if self.loss_type == "meanflow" else None
+            v = self.predict_velocity(x, t, h=h_val)
             velocities.append(v)
             x = x + v * dt  # Euler step in normalized space
 
@@ -173,6 +187,7 @@ class FlowTransformerText(nn.Module):
         attention_mask: torch.Tensor,
         train_flow: bool = False,
         x_t_teacher: Optional[List[torch.Tensor]] = None,
+        num_inference_steps: Optional[int] = None,
     ):
         """Forward pass.
 
@@ -181,6 +196,8 @@ class FlowTransformerText(nn.Module):
             attention_mask: (B, S) attention mask
             train_flow: If True, takes teacher x_t and returns velocities for flow loss
             x_t_teacher: Teacher's hidden states at each replaced layer (for training)
+            num_inference_steps: Override num_steps for flow integration at inference
+                (e.g., 1 for 1-step MeanFlow inference, None = use default)
 
         Returns:
             If train_flow=True:
@@ -220,7 +237,7 @@ class FlowTransformerText(nn.Module):
         x = prefix_output.last_hidden_state
 
         # 2. Run flow steps (replace layers from_layer to to_layer-1)
-        x, velocities = self.flow_forward(x)
+        x, velocities = self.flow_forward(x, num_steps=num_inference_steps)
 
         # 3. Run frozen suffix layers
         x_layer = x

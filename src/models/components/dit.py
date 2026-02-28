@@ -1,7 +1,8 @@
 """DiT (Diffusion Transformer) backbone for flow matching.
 
 Adapted from TransDiff/CIFAR/models/DiT.py. Uses adaLN-Zero conditioning
-on timestep for velocity field prediction in the flow matching framework.
+on timestep (and optionally interval width h for MeanFlow) for velocity field
+prediction in the flow matching framework.
 """
 
 import math
@@ -88,6 +89,7 @@ class DiT(nn.Module):
     """DiT backbone: timestep-conditioned transformer blocks.
 
     Takes hidden states (B, S, D) and timestep (B,), returns transformed hidden states.
+    Optionally accepts interval width h (B,) for MeanFlow-style mean velocity prediction.
     """
 
     def __init__(
@@ -96,10 +98,14 @@ class DiT(nn.Module):
         depth: int = 1,
         num_heads: int = 14,
         mlp_ratio: float = 4.0,
+        use_h_embedding: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
+        self.use_h_embedding = use_h_embedding
         self.t_embedder = TimestepEmbedder(hidden_size)
+        if use_h_embedding:
+            self.h_embedder = TimestepEmbedder(hidden_size)
         self.blocks = nn.ModuleList(
             [DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)]
         )
@@ -116,20 +122,29 @@ class DiT(nn.Module):
         # Initialize timestep embedding MLP
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # Initialize h embedding MLP (if present)
+        if self.use_h_embedding:
+            nn.init.normal_(self.h_embedder.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.h_embedder.mlp[2].weight, std=0.02)
         # Zero-out adaLN modulation layers
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, t):
+    def forward(self, x, t, h=None):
         """
         Args:
             x: (B, S, D) hidden states
             t: (B,) timestep indices or continuous timesteps
+            h: (B,) interval width for MeanFlow (optional, defaults to 0)
         Returns:
             (B, S, D) transformed hidden states
         """
-        t_emb = self.t_embedder(t)  # (B, D)
+        c = self.t_embedder(t)  # (B, D)
+        if self.use_h_embedding:
+            if h is None:
+                h = torch.zeros_like(t)
+            c = c + self.h_embedder(h)  # (B, D)
         for block in self.blocks:
-            x = block(x, t_emb)
+            x = block(x, c)
         return x

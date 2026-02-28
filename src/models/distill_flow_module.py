@@ -6,17 +6,16 @@ discretized ODE step:
     X_{t+1} = FM_θ^(t)(X_t)
     velocity_target = (X_{t+1} - X_t) / Δt
 
-To ease learning, we apply *conditional flow matching* within each layer
-interval: instead of only training at layer boundaries, we sample s ~ U(0,1)
-and construct interpolated inputs X_s = (1-s) X_t + s X_{t+1} at continuous
-time t_s = (l+s)/N. The velocity target is constant along the linear path,
-so the student sees a richer, smoother training signal.
-
-The student u_ω(X_s, t_s) is distilled to match these velocity targets, defining
-a Neural ODE: dX_t = u_ω(X_t, t) dt.
+Supports two loss modes:
+  - "velocity": Standard single-step velocity matching. Optionally with CFM
+    interpolation (use_interpolation=True).
+  - "meanflow": Multi-scale mean velocity matching (adapted from MeanFlow,
+    Geng et al. 2025). The network u_ω(X, t, h) learns to predict the mean
+    velocity over interval [t, t+h] for any interval width h. This enables
+    adaptive-step and even 1-step inference.
 
 Training stages:
-  - Stage 1: Velocity matching loss (MSE between predicted and target velocity)
+  - Stage 1: Velocity/MeanFlow matching loss (MSE)
   - Stage 2: Cross-entropy loss on classification labels (freeze flow, unfreeze suffix)
 """
 
@@ -64,6 +63,9 @@ class DistillFlowModule(LightningModule):
         teacher_dropout: float = 0.1,
         scale_div: float = 1.0,
         use_interpolation: bool = False,
+        loss_type: str = "velocity",
+        data_proportion: float = 0.5,
+        num_inference_steps: Optional[int] = None,
         learning_rate: float = 1e-4,
         lr_stage2: float = 1e-5,
         weight_decay: float = 0.01,
@@ -92,6 +94,7 @@ class DistillFlowModule(LightningModule):
             from_layer=from_layer,
             to_layer=to_layer,
             scale_div=scale_div,
+            loss_type=loss_type,
         )
 
         # Transfer teacher weights to student
@@ -308,6 +311,90 @@ class DistillFlowModule(LightningModule):
 
         return total_loss / num_steps
 
+    def _compute_meanflow_loss(
+        self,
+        x_t_teacher: List[torch.Tensor],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute multi-scale mean velocity matching loss (MeanFlow-style).
+
+        Adapted from MeanFlow (Gao et al., 2025): the network u_ω(X, t, h) learns
+        to predict the mean velocity over interval [t, t+h] for arbitrary h.
+
+        For each sample in the batch:
+          - With probability `data_proportion`: use single-step interval (h = Δt),
+            training fine-grained velocity (analogous to h→0 in MeanFlow).
+          - Otherwise: sample random multi-layer interval [a, b] where b - a ≥ 2,
+            training coarse-grained mean velocity.
+
+        Mean velocity target from teacher trajectory:
+            v̄ = (X_b - X_a) / h,  where h = (b - a) · Δt
+
+        This multi-scale supervision teaches the network to handle any step size,
+        enabling adaptive-step and even 1-step inference.
+        """
+        from_l = self.hparams.from_layer
+        to_l = self.hparams.to_layer
+        num_steps = to_l - from_l
+        delta_t = 1.0 / num_steps
+        scale_div = self.hparams.scale_div
+        data_proportion = self.hparams.data_proportion
+
+        B = x_t_teacher[from_l].shape[0]
+        device = x_t_teacher[from_l].device
+        dtype = x_t_teacher[from_l].dtype
+
+        # Stack teacher hidden states: (num_steps+1, B, S, D)
+        x_stack = torch.stack(
+            [x_t_teacher[i].detach() for i in range(from_l, to_l + 1)], dim=0
+        )
+
+        # --- Sample start layers (a) uniformly from [0, num_steps) ---
+        a_indices = torch.randint(0, num_steps, (B,), device=device)
+
+        # --- Determine span for each sample ---
+        single_step_mask = torch.rand(B, device=device) < data_proportion
+        max_span = num_steps - a_indices  # max possible span per sample
+
+        # Multi-step: random span in [2, max_span]
+        random_span = torch.randint(2, num_steps + 1, (B,), device=device)
+        random_span = torch.clamp(random_span, max=max_span)
+        random_span = torch.clamp(random_span, min=2)
+
+        # Force single-step when max_span <= 1 (a is at the last position)
+        forced_single = max_span <= 1
+        single_step_mask = single_step_mask | forced_single
+
+        span = torch.where(single_step_mask, torch.ones(B, device=device, dtype=torch.long), random_span)
+        b_indices = a_indices + span
+
+        # --- Gather start/end hidden states via advanced indexing ---
+        batch_idx = torch.arange(B, device=device)
+        X_a = x_stack[a_indices, batch_idx] / scale_div  # (B, S, D)
+        X_b = x_stack[b_indices, batch_idx] / scale_div  # (B, S, D)
+
+        # --- Mean velocity target: (X_b - X_a) / h ---
+        h = span.float() * delta_t  # (B,) interval width
+        v_target = (X_b - X_a) / h[:, None, None]  # (B, S, D)
+
+        # --- Normalized time and h for network input ---
+        t = a_indices.float() * delta_t  # (B,)
+
+        # --- Predict mean velocity: u_ω(X_a, t, h) ---
+        v_pred = self.student.predict_velocity(X_a, t, h=h)
+
+        # --- MSE loss ---
+        loss = F.mse_loss(v_pred, v_target)
+        return loss
+
+    def _get_flow_loss(self, x_t_teacher, input_ids, attention_mask):
+        """Dispatch to the appropriate flow loss based on loss_type."""
+        if self.hparams.loss_type == "meanflow":
+            return self._compute_meanflow_loss(x_t_teacher, input_ids, attention_mask)
+        else:
+            return self._compute_flow_loss(x_t_teacher, input_ids, attention_mask)
+
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
@@ -323,7 +410,7 @@ class DistillFlowModule(LightningModule):
             x_t_teacher = self._get_teacher_trajectory(
                 input_ids, attention_mask
             )
-            flow_loss = self._compute_flow_loss(x_t_teacher, input_ids, attention_mask)
+            flow_loss = self._get_flow_loss(x_t_teacher, input_ids, attention_mask)
             loss = self.hparams.lambda_flow * flow_loss
 
             self.train_flow_loss(flow_loss)
@@ -350,7 +437,7 @@ class DistillFlowModule(LightningModule):
             x_t_teacher = self._get_teacher_trajectory(
                 input_ids, attention_mask
             )
-            flow_loss = self._compute_flow_loss(x_t_teacher, input_ids, attention_mask)
+            flow_loss = self._get_flow_loss(x_t_teacher, input_ids, attention_mask)
             pooled_logits, _ = self.student(input_ids, attention_mask)
             ce_loss = self.ce_loss(pooled_logits, labels)
             loss = self.hparams.lambda_flow * flow_loss + self.hparams.lambda_ce * ce_loss
@@ -374,7 +461,10 @@ class DistillFlowModule(LightningModule):
         attention_mask = batch["attention_mask"]
         labels = batch["label"]
 
-        pooled_logits, _ = self.student(input_ids, attention_mask)
+        pooled_logits, _ = self.student(
+            input_ids, attention_mask,
+            num_inference_steps=self.hparams.num_inference_steps,
+        )
         loss = self.ce_loss(pooled_logits, labels)
         preds = torch.argmax(pooled_logits, dim=-1)
 
@@ -454,7 +544,10 @@ class DistillFlowModule(LightningModule):
         attention_mask = batch["attention_mask"]
         labels = batch["label"]
 
-        pooled_logits, _ = self.student(input_ids, attention_mask)
+        pooled_logits, _ = self.student(
+            input_ids, attention_mask,
+            num_inference_steps=self.hparams.num_inference_steps,
+        )
         preds = torch.argmax(pooled_logits, dim=-1)
 
         self.test_acc(preds, labels)

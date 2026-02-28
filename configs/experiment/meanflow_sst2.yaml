@@ -1,0 +1,65 @@
+# @package _global_
+
+# MeanFlow distillation: Qwen2 on SST-2 → flow-based model with multi-scale velocity
+# Learns mean velocity u(X, t, h) over arbitrary intervals, enabling 1-step inference.
+# Run: python src/train.py experiment=meanflow_sst2 model.teacher_ckpt_path=/path/to/best.ckpt
+
+defaults:
+  - override /data: glue
+  - override /model: distill_flow
+  - override /callbacks: default
+  - override /trainer: gpu
+
+tags: ["qwen2", "sst2", "meanflow", "distill"]
+
+seed: 42
+
+trainer:
+  min_epochs: 1
+  max_epochs: 20
+  # gradient_clip_val: 1.0
+  precision: "32"
+  # accumulate_grad_batches: 1
+  devices: 2
+  strategy: "ddp_find_unused_parameters_true"
+
+data:
+  task_name: "sst2"
+  model_name: "Qwen/Qwen2.5-0.5B"
+  max_length: 128
+  batch_size: 64
+  num_workers: 16
+
+model:
+  model_name: "Qwen/Qwen2.5-0.5B"
+  teacher_ckpt_path: null  # REQUIRED: set via CLI
+  num_labels: 2
+  from_layer: 6
+  to_layer: 18
+  dit_depth: 2
+  mlp_ratio: 4.0
+  dropout: 0.1
+  loss_type: "meanflow"
+  data_proportion: 0.5  # 50% single-step, 50% multi-step
+  num_inference_steps: null  # null = use N steps; set to 1 for 1-step inference test
+  learning_rate: 1e-4
+  lr_stage2: 1e-5
+  weight_decay: 0.01
+  epochs_stage1: 15
+  lambda_flow: 1.0
+  lambda_ce: 1.0
+
+logger:
+  wandb:
+    name: "meanflow_sst2_L${model.from_layer}-${model.to_layer}_dp${model.data_proportion}"
+    group: "meanflow"
+    job_type: "distill"
+
+callbacks:
+  model_checkpoint:
+    monitor: "val/accuracy"
+    mode: "max"
+  early_stopping:
+    monitor: "val/accuracy"
+    mode: "max"
+    patience: 10
