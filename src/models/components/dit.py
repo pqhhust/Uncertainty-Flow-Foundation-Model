@@ -9,11 +9,31 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def modulate(x, shift, scale):
     """Apply adaptive layer norm modulation."""
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class SwiGLU(nn.Module):
+    """SwiGLU activation: element-wise product of SiLU-gated and linear projections.
+
+    Replaces the (Linear + activation) pair in standard MLPs with two parallel
+    linear projections — one passed through SiLU (gate) and one kept linear (up) —
+    whose element-wise product forms the output.
+
+    Reference: Shazeer, "GLU Variants Improve Transformer", 2020.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.w_gate = nn.Linear(in_features, out_features, bias=bias)
+        self.w_up = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        return F.silu(self.w_gate(x)) * self.w_up(x)
 
 
 class TimestepEmbedder(nn.Module):
@@ -22,8 +42,7 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
+            SwiGLU(frequency_embedding_size, hidden_size, bias=True),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
@@ -59,14 +78,13 @@ class DiTBlock(nn.Module):
             hidden_size, num_heads, batch_first=True
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        mlp_hidden_dim = int(2 * hidden_size * mlp_ratio / 3)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim),
-            nn.GELU(),
+            SwiGLU(hidden_size, mlp_hidden_dim),
             nn.Linear(mlp_hidden_dim, hidden_size),
         )
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
+            SwiGLU(hidden_size, hidden_size),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
 
@@ -119,13 +137,15 @@ class DiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
         self.apply(_basic_init)
-        # Initialize timestep embedding MLP
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        # Initialize timestep embedding MLP (mlp[0] = SwiGLU, mlp[1] = Linear)
+        for name in ('w_gate', 'w_up'):
+            nn.init.normal_(getattr(self.t_embedder.mlp[0], name).weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[1].weight, std=0.02)
         # Initialize h embedding MLP (if present)
         if self.use_h_embedding:
-            nn.init.normal_(self.h_embedder.mlp[0].weight, std=0.02)
-            nn.init.normal_(self.h_embedder.mlp[2].weight, std=0.02)
+            for name in ('w_gate', 'w_up'):
+                nn.init.normal_(getattr(self.h_embedder.mlp[0], name).weight, std=0.02)
+            nn.init.normal_(self.h_embedder.mlp[1].weight, std=0.02)
         # Zero-out adaLN modulation layers
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
